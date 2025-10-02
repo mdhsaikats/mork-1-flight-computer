@@ -55,10 +55,12 @@ const int maxFailCount = 5;
 
 // Altitude calculation variables
 float baselinePressure = 1013.25; // Sea level pressure in hPa
+float groundPressure = 0; // Will be calibrated on startup
 float currentAltitude = 0;
 float previousAltitude = 0;
 float verticalSpeed = 0;
 unsigned long lastAltitudeTime = 0;
+bool pressureCalibrated = false;
 
 // Flight state machine
 enum FlightState {
@@ -146,17 +148,45 @@ void logSensorData() {
     dataFile.print(",");
     dataFile.print(currentAltitude);
     dataFile.print(",");
-    dataFile.println(verticalSpeed);
+    dataFile.print(verticalSpeed);
+    dataFile.print(",");
+    dataFile.println(flightState);
     dataFile.close();
     lastLogTime = millis();
   }
+}
+
+// Safety checks and sensor validation
+bool validateSensorData() {
+  // Check for reasonable sensor values
+  if (abs(roll) > 180 || abs(pitch) > 180) {
+    Serial.println("WARNING: Invalid MPU data");
+    return false;
+  }
+  
+  if (bmp.readTemperature() < -40 || bmp.readTemperature() > 85) {
+    Serial.println("WARNING: Invalid temperature data");
+    return false;
+  }
+  
+  if (abs(verticalSpeed) > 200) { // 200 m/s = 720 km/h (unrealistic for model rocket)
+    Serial.println("WARNING: Invalid vertical speed");
+    return false;
+  }
+  
+  return true;
 }
 
 // Calculate altitude from pressure
 void calculateAltitude() {
   float pressure = bmp.readPressure() / 100.0; // Convert to hPa
   previousAltitude = currentAltitude;
-  currentAltitude = 44330.0 * (1.0 - pow(pressure / baselinePressure, 0.1903));
+  
+  if (pressureCalibrated) {
+    currentAltitude = 44330.0 * (1.0 - pow(pressure / groundPressure, 0.1903));
+  } else {
+    currentAltitude = 44330.0 * (1.0 - pow(pressure / baselinePressure, 0.1903));
+  }
   
   // Calculate vertical speed
   unsigned long currentTime = millis();
@@ -167,26 +197,65 @@ void calculateAltitude() {
   lastAltitudeTime = currentTime;
 }
 
+// Calibrate ground level pressure
+void calibrateGroundPressure() {
+  if (!bmpOk) return;
+  
+  Serial.println("Calibrating ground pressure...");
+  float pressureSum = 0;
+  int samples = 10;
+  
+  for (int i = 0; i < samples; i++) {
+    pressureSum += bmp.readPressure() / 100.0;
+    delay(100);
+  }
+  
+  groundPressure = pressureSum / samples;
+  pressureCalibrated = true;
+  
+  Serial.print("Ground pressure calibrated: ");
+  Serial.print(groundPressure);
+  Serial.println(" hPa");
+  
+  // Flash LEDs to indicate calibration complete
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(greenLedPin, HIGH);
+    digitalWrite(redLedPin, HIGH);
+    delay(200);
+    digitalWrite(greenLedPin, LOW);
+    digitalWrite(redLedPin, LOW);
+    delay(200);
+  }
+}
+
 // Update flight state based on sensor data
 void updateFlightState() {
   static unsigned long stateChangeTime = 0;
+  static unsigned long launchFlashTime = 0;
+  static int flashCount = 0;
+  static bool flashState = false;
   
   switch (flightState) {
     case GROUND:
       if (currentAltitude > launchThreshold) {
         flightState = ASCENT;
         stateChangeTime = millis();
-        // Flash green LED rapidly for launch detection
-        for (int i = 0; i < 5; i++) {
-          digitalWrite(greenLedPin, HIGH);
-          delay(50);
-          digitalWrite(greenLedPin, LOW);
-          delay(50);
-        }
+        launchFlashTime = millis();
+        flashCount = 0;
+        flashState = false;
+        Serial.println("LAUNCH DETECTED!");
       }
       break;
       
     case ASCENT:
+      // Non-blocking launch flash sequence
+      if (flashCount < 10 && millis() - launchFlashTime >= 50) {
+        flashState = !flashState;
+        digitalWrite(greenLedPin, flashState ? HIGH : LOW);
+        launchFlashTime = millis();
+        flashCount++;
+      }
+      
       if (currentAltitude > maxAltitude) {
         maxAltitude = currentAltitude;
       }
@@ -194,6 +263,7 @@ void updateFlightState() {
         flightState = DESCENT;
         stateChangeTime = millis();
         tone(buzzerPin, 2000, 500); // High pitch beep for apogee
+        Serial.println("APOGEE DETECTED!");
       }
       break;
       
@@ -201,8 +271,8 @@ void updateFlightState() {
       if (currentAltitude < launchThreshold && verticalSpeed > -1.0) {
         flightState = RECOVERY;
         stateChangeTime = millis();
-        // Continuous tone for recovery
-        tone(buzzerPin, 800);
+        tone(buzzerPin, 800); // Continuous tone for recovery
+        Serial.println("RECOVERY MODE!");
       }
       break;
       
@@ -281,6 +351,13 @@ void setup() {
   if (sdOk) {
     initializeLogging();
   }
+  
+  // Calibrate ground pressure if BMP180 is available
+  if (bmpOk) {
+    calibrateGroundPressure();
+  }
+  
+  Serial.println("Flight computer ready!");
 }
 
 void loop() {
@@ -325,15 +402,30 @@ void loop() {
   if (bmpOk && mpuOk && millis() - lastSensorRead >= sensorInterval) {
     // Read MPU and control servos
     readMPU();
-    controlServos();
     
-    // Calculate altitude and vertical speed
-    calculateAltitude();
+    // Validate sensor data before using it
+    if (validateSensorData()) {
+      controlServos();
+      
+      // Calculate altitude and vertical speed
+      calculateAltitude();
+      
+      // Update flight state
+      updateFlightState();
+      
+      // Reset fail count on successful read
+      sensorFailCount = 0;
+    } else {
+      sensorFailCount++;
+      if (sensorFailCount >= maxFailCount) {
+        Serial.println("CRITICAL: Too many sensor failures - entering safe mode");
+        // Put servos in safe position
+        servo1.write(90);
+        servo2.write(90);
+      }
+    }
     
-    // Update flight state
-    updateFlightState();
-    
-    // Log data to SD card
+    // Log data to SD card (even if validation fails, for debugging)
     logSensorData();
     
     lastSensorRead = millis();
