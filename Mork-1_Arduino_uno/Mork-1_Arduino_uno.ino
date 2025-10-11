@@ -443,6 +443,7 @@ void loop() {
     
     // Log data to SD card (even if validation fails, for debugging)
     logSensorData();
+    
 
 if (bmpOk && mpuOk) {
     float temp = bmp.readTemperature(); // Celsius
@@ -451,7 +452,6 @@ if (bmpOk && mpuOk) {
     udp.print(dataToSend);
     udp.endPacket();
 }
-
 
 
     
