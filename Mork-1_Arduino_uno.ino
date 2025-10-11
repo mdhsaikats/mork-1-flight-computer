@@ -26,6 +26,8 @@ const int chipSelect = 5; // SD card CS pin
 const int servo1Pin = 25;
 const int servo2Pin = 26;
 
+
+
 // Objects
 Adafruit_BMP085 bmp;
 MPU6050 mpu;
