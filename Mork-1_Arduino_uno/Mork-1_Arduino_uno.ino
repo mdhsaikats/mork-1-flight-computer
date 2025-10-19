@@ -56,6 +56,8 @@ unsigned long lastSensorRead = 0;
 unsigned long sensorInterval = 50; // Read sensors every 50ms
 unsigned long lastSerialPrint = 0;
 unsigned long serialInterval = 200; // Print to serial every 200ms
+unsigned long lastUDPSend = 0;
+unsigned long udpInterval = 100; // Send telemetry every 100ms
 
 // Error handling variables
 unsigned long lastComponentCheck = 0;
@@ -174,8 +176,16 @@ bool validateSensorData() {
     return false;
   }
   
-  if (bmp.readTemperature() < -40 || bmp.readTemperature() > 85) {
+  // Read temperature only once to avoid multiple I2C reads
+  float temp = bmp.readTemperature();
+  if (temp < -40 || temp > 85) {
     Serial.println("WARNING: Invalid temperature data");
+    return false;
+  }
+  
+  // Check altitude is reasonable (allow negative for below sea level)
+  if (abs(currentAltitude) > 10000) { // 10km absolute limit
+    Serial.println("WARNING: Invalid altitude data");
     return false;
   }
   
@@ -189,7 +199,16 @@ bool validateSensorData() {
 
 // Calculate altitude from pressure
 void calculateAltitude() {
+  if (!bmpOk) return;
+  
   float pressure = bmp.readPressure() / 100.0; // Convert to hPa
+  
+  // Sanity check pressure reading
+  if (pressure < 300 || pressure > 1100) {
+    Serial.println("WARNING: Invalid pressure reading");
+    return;
+  }
+  
   previousAltitude = currentAltitude;
   
   if (pressureCalibrated) {
@@ -198,11 +217,15 @@ void calculateAltitude() {
     currentAltitude = 44330.0 * (1.0 - pow(pressure / baselinePressure, 0.1903));
   }
   
-  // Calculate vertical speed
+  // Calculate vertical speed with moving average filter
   unsigned long currentTime = millis();
   if (lastAltitudeTime > 0) {
     float deltaTime = (currentTime - lastAltitudeTime) / 1000.0; // Convert to seconds
-    verticalSpeed = (currentAltitude - previousAltitude) / deltaTime;
+    if (deltaTime > 0.01) { // Avoid division by very small numbers
+      float instantSpeed = (currentAltitude - previousAltitude) / deltaTime;
+      // Apply low-pass filter to smooth vertical speed
+      verticalSpeed = 0.7 * verticalSpeed + 0.3 * instantSpeed;
+    }
   }
   lastAltitudeTime = currentTime;
 }
@@ -244,21 +267,39 @@ void updateFlightState() {
   static unsigned long launchFlashTime = 0;
   static int flashCount = 0;
   static bool flashState = false;
+  static unsigned long groundCheckTime = 0;
+  static int groundCheckCount = 0;
   
   switch (flightState) {
     case GROUND:
-      if (currentAltitude > launchThreshold) {
-        flightState = ASCENT;
-        stateChangeTime = millis();
-        launchFlashTime = millis();
-        flashCount = 0;
-        flashState = false;
-        Serial.println("LAUNCH DETECTED!");
+      // Require sustained altitude increase to prevent false launch detection
+      if (currentAltitude > launchThreshold && verticalSpeed > 1.0) {
+        if (groundCheckTime == 0) {
+          groundCheckTime = millis();
+          groundCheckCount = 0;
+        }
+        
+        if (millis() - groundCheckTime > 500) { // 500ms sustained
+          groundCheckCount++;
+          if (groundCheckCount >= 3) {
+            flightState = ASCENT;
+            stateChangeTime = millis();
+            launchFlashTime = millis();
+            flashCount = 0;
+            flashState = false;
+            Serial.println("LAUNCH DETECTED!");
+            tone(buzzerPin, 2500, 200); // Launch beep
+          }
+          groundCheckTime = millis();
+        }
+      } else {
+        groundCheckTime = 0;
+        groundCheckCount = 0;
       }
       break;
       
     case ASCENT:
-      // Non-blocking launch flash sequence
+      // Non-blocking launch flash sequence (first 500ms only)
       if (flashCount < 10 && millis() - launchFlashTime >= 50) {
         flashState = !flashState;
         digitalWrite(greenLedPin, flashState ? HIGH : LOW);
@@ -266,28 +307,46 @@ void updateFlightState() {
         flashCount++;
       }
       
+      // Track max altitude
       if (currentAltitude > maxAltitude) {
         maxAltitude = currentAltitude;
       }
-      if (verticalSpeed < -recoveryThreshold && millis() - stateChangeTime > 2000) {
+      
+      // Detect apogee: negative velocity AND below peak altitude
+      if (verticalSpeed < -recoveryThreshold && 
+          currentAltitude < (maxAltitude - 0.5) && 
+          millis() - stateChangeTime > 1000) { // Minimum 1 second ascent
         flightState = DESCENT;
         stateChangeTime = millis();
         tone(buzzerPin, 2000, 500); // High pitch beep for apogee
-        Serial.println("APOGEE DETECTED!");
+        Serial.print("APOGEE DETECTED! Max altitude: ");
+        Serial.print(maxAltitude);
+        Serial.println(" m");
       }
       break;
       
     case DESCENT:
-      if (currentAltitude < launchThreshold && verticalSpeed > -1.0) {
+      // Detect landing: low altitude AND low velocity
+      if (currentAltitude < launchThreshold && 
+          abs(verticalSpeed) < 1.0 && 
+          millis() - stateChangeTime > 2000) { // Minimum 2 seconds descent
         flightState = RECOVERY;
         stateChangeTime = millis();
-        tone(buzzerPin, 800); // Continuous tone for recovery
-        Serial.println("RECOVERY MODE!");
+        Serial.println("LANDING DETECTED - RECOVERY MODE!");
+        Serial.print("Final altitude: ");
+        Serial.print(currentAltitude);
+        Serial.println(" m");
       }
       break;
       
     case RECOVERY:
       // Stay in recovery mode - beacon active
+      // Intermittent buzzer pattern to save power
+      if ((millis() / 2000) % 2 == 0) {
+        tone(buzzerPin, 800);
+      } else {
+        noTone(buzzerPin);
+      }
       break;
   }
   
@@ -335,6 +394,14 @@ void readMPU() {
 
 // Map MPU tilt to servo angles (0-180)
 void controlServos() {
+  // Disable servo control during ground state to save power
+  if (flightState == GROUND || flightState == RECOVERY) {
+    servo1.write(90); // Neutral position
+    servo2.write(90);
+    return;
+  }
+  
+  // Active stabilization during flight
   int servo1Angle = constrain(90 + filteredRoll, 0, 180);
   int servo2Angle = constrain(90 + filteredPitch, 0, 180);
 
@@ -349,16 +416,25 @@ void setup() {
   pinMode(buttonPin, INPUT_PULLUP); // Button with internal pull-up
 
   Serial.begin(115200);
-// Start ESP32 as Access Point
-WiFi.softAP(apSSID, apPassword);
-Serial.print("AP IP: ");
-Serial.println(WiFi.softAPIP());
+  delay(1000); // Wait for serial to stabilize
+  
+  Serial.println("\n=== MORK-1 Flight Computer ===");
+  Serial.println("Initializing systems...");
+  
+  // Start ESP32 as Access Point
+  WiFi.softAP(apSSID, apPassword);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+  
+  // Start UDP
+  udp.begin(4210);
+  Serial.println("UDP telemetry ready");
 
-
-
-  // Attach servos
+  // Attach servos and set to neutral
   servo1.attach(servo1Pin);
   servo2.attach(servo2Pin);
+  servo1.write(90);
+  servo2.write(90);
 
   // Initial check
   checkComponents();
@@ -416,20 +492,15 @@ void loop() {
 
   // Continuous sensor readings and servo control
   if (bmpOk && mpuOk && millis() - lastSensorRead >= sensorInterval) {
-    // Read MPU and control servos
+    // Read MPU angles first
     readMPU();
+    
+    // Calculate altitude and vertical speed BEFORE validation
+    calculateAltitude();
     
     // Validate sensor data before using it
     if (validateSensorData()) {
       controlServos();
-      
-      // Calculate altitude and vertical speed
-      calculateAltitude();
-      
-      // Update flight state
-      updateFlightState();
-      
-      // Reset fail count on successful read
       sensorFailCount = 0;
     } else {
       sensorFailCount++;
@@ -444,28 +515,41 @@ void loop() {
     // Log data to SD card (even if validation fails, for debugging)
     logSensorData();
     
-
-if (bmpOk && mpuOk) {
+    lastSensorRead = millis();
+  }
+  
+  // Send telemetry via UDP at controlled rate
+  if (bmpOk && mpuOk && millis() - lastUDPSend >= udpInterval) {
     float temp = bmp.readTemperature(); // Celsius
-    String dataToSend = String(currentAltitude) + "," + String(verticalSpeed) + "," + String(roll) + "," + String(pitch) + "," + String(temp);
+    String dataToSend = String(currentAltitude) + "," + String(verticalSpeed) + "," + 
+                        String(roll) + "," + String(pitch) + "," + String(temp) + "," +
+                        String(flightState) + "," + String(maxAltitude);
     udp.beginPacket(groundIP, groundPort);
     udp.print(dataToSend);
     udp.endPacket();
-}
-
-
-    
-    lastSensorRead = millis();
+    lastUDPSend = millis();
   }
+  
+  // Update flight state ALWAYS (outside sensor read block)
+  updateFlightState();
 
   // Print sensor data at slower rate
   if (bmpOk && mpuOk && millis() - lastSerialPrint >= serialInterval) {
-    Serial.print("Roll: "); Serial.print(roll);
-    Serial.print(" | Pitch: "); Serial.print(pitch);
-    Serial.print(" | Altitude: "); Serial.print(currentAltitude);
-    Serial.print(" m | Vertical Speed: "); Serial.print(verticalSpeed);
-    Serial.print(" m/s | BMP180 Temp: "); Serial.print(bmp.readTemperature());
-    Serial.print(" C | Pressure: "); Serial.println(bmp.readPressure());
+    Serial.print("State: ");
+    switch(flightState) {
+      case GROUND: Serial.print("GROUND"); break;
+      case ARMED: Serial.print("ARMED"); break;
+      case ASCENT: Serial.print("ASCENT"); break;
+      case DESCENT: Serial.print("DESCENT"); break;
+      case RECOVERY: Serial.print("RECOVERY"); break;
+    }
+    Serial.print(" | Alt: "); Serial.print(currentAltitude, 2);
+    Serial.print("m | VelZ: "); Serial.print(verticalSpeed, 2);
+    Serial.print("m/s | Roll: "); Serial.print(roll, 1);
+    Serial.print("° | Pitch: "); Serial.print(pitch, 1);
+    Serial.print("° | Temp: "); Serial.print(bmp.readTemperature(), 1);
+    Serial.print("°C | Press: "); Serial.print(bmp.readPressure() / 100.0, 1);
+    Serial.println(" hPa");
     
     lastSerialPrint = millis();
   }
