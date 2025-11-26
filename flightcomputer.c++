@@ -1,146 +1,128 @@
 #include <Wire.h>
-#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include <MPU6050.h>
 #include <Adafruit_BMP085.h>
-#include "MPU6050.h"
 
-// I2C pins
-#define SDA_PIN 4
-#define SCL_PIN 5
-
-// Pins
-#define BUTTON_PIN 3
-#define RED_LED 8
-#define GREEN_LED 9
-
-// OLED
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// Sensors
-Adafruit_BMP085 bmp;
+// === Sensors ===
 MPU6050 mpu;
+Adafruit_BMP085 bmp;
 
-bool sensorsOk = false;
+// === Servos ===
+Servo servoPitch;   // X-axis correction
+Servo servoYaw;     // Y-axis correction
+
+int servoPitchPin = 7;
+int servoYawPin   = 10;
+
+// === LEDs ===
+const int RED_LED = 2;
+const int GREEN_LED = 3;
+
+// === PID parameters ===
+float Kp = 1.0;
+float Ki = 0.02;
+float Kd = 0.15;
+
+float errorX, errorY;
+float prevX, prevY;
+float intX = 0, intY = 0;
+
+unsigned long lastTime = 0;
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(500);
 
-  // LEDs and button
+  Wire.begin(5, 6);   // SDA=5, SCL=6 (ESP32-C3)
+
   pinMode(RED_LED, OUTPUT);
   pinMode(GREEN_LED, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  digitalWrite(RED_LED, LOW);
-  digitalWrite(GREEN_LED, HIGH);
+  // Attach servos
+  servoPitch.attach(servoPitchPin, 500, 2500);
+  servoYaw.attach(servoYawPin, 500, 2500);
 
-  // I2C
-  Wire.begin(SDA_PIN, SCL_PIN);
-
-  // Initialize OLED
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED init failed!");
-    digitalWrite(RED_LED, HIGH);
-    digitalWrite(GREEN_LED, LOW);
-  } else {
-    Serial.println("OLED OK");
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
-    display.println("System Starting...");
-    display.display();
-  }
+  servoPitch.write(90);  
+  servoYaw.write(90);
 
   // Initialize sensors
-  if(!bmp.begin()) {
-    Serial.println("BMP180 init failed!");
+  if (!bmp.begin()) {
+    Serial.println("BMP180 ERROR!");
     digitalWrite(RED_LED, HIGH);
-    digitalWrite(GREEN_LED, LOW);
-  } else {
-    Serial.println("BMP180 OK");
+    while (1);
   }
 
   mpu.initialize();
-  if(!mpu.testConnection()) {
-    Serial.println("MPU6050 connection failed!");
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 ERROR!");
     digitalWrite(RED_LED, HIGH);
-    digitalWrite(GREEN_LED, LOW);
-  } else {
-    Serial.println("MPU6050 OK");
+    while (1);
   }
 
-  sensorsOk = bmp.begin() && mpu.testConnection();
+  Serial.println("SYSTEM OK");
+  digitalWrite(GREEN_LED, HIGH);
 
-  if(sensorsOk) {
-    display.println("All sensors OK");
-    display.display();
-  }
-}
-
-void showData() {
-  float temp = bmp.readTemperature();
-  float pressure = bmp.readPressure();
-
-  int16_t ax, ay, az, gx, gy, gz;
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
-
-  // Serial output
-  Serial.println("=== Sensor Data ===");
-  Serial.print("BMP180 Temp: "); Serial.print(temp); Serial.println(" °C");
-  Serial.print("BMP180 Pressure: "); Serial.print(pressure / 100); Serial.println(" hPa");
-  Serial.println("MPU6050 Acceleration:");
-  Serial.print("AX: "); Serial.println(ax);
-  Serial.print("AY: "); Serial.println(ay);
-  Serial.print("AZ: "); Serial.println(az);
-  Serial.println("MPU6050 Gyroscope:");
-  Serial.print("GX: "); Serial.println(gx);
-  Serial.print("GY: "); Serial.println(gy);
-  Serial.print("GZ: "); Serial.println(gz);
-  Serial.println("===================");
-
-  // OLED output
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.setTextSize(1);
-  display.println("BMP180:");
-  display.print("Temp: "); display.print(temp); display.println(" C");
-  display.print("Pres: "); display.print(pressure/100); display.println(" hPa");
-
-  display.println("\nMPU6050:");
-  display.print("AX: "); display.println(ax);
-  display.print("AY: "); display.println(ay);
-  display.print("AZ: "); display.println(az);
-  display.display();
+  lastTime = millis();
 }
 
 void loop() {
-  // Test on button press
-  if(digitalRead(BUTTON_PIN) == LOW) {
-    delay(200); // debounce
+  // === READ MPU6050 ===
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
 
-    bool ok = bmp.begin() && mpu.testConnection();
-    if(ok) {
-      digitalWrite(RED_LED, LOW);
-      digitalWrite(GREEN_LED, HIGH);
-      showData();
-    } else {
-      digitalWrite(RED_LED, HIGH);
-      digitalWrite(GREEN_LED, LOW);
-      Serial.println("Sensor test failed!");
-      display.clearDisplay();
-      display.setTextSize(2);
-      display.setCursor(0,0);
-      display.println("ERROR!");
-      display.display();
-    }
+  // Convert gyro values to deg/sec
+  float rateX = gx / 131.0;   // PITCH
+  float rateY = gy / 131.0;   // YAW
 
-    while(digitalRead(BUTTON_PIN) == LOW); // wait until released
-    delay(200);
+  // === PID control ===
+  unsigned long now = millis();
+  float dt = (now - lastTime) / 1000.0;
+  lastTime = now;
+
+  // Desired = 0 (rocket should be stable)
+  errorX = 0 - rateX;
+  errorY = 0 - rateY;
+
+  intX += errorX * dt;
+  intY += errorY * dt;
+
+  float dX = (errorX - prevX) / dt;
+  float dY = (errorY - prevY) / dt;
+
+  prevX = errorX;
+  prevY = errorY;
+
+  float outX = (Kp * errorX) + (Ki * intX) + (Kd * dX);
+  float outY = (Kp * errorY) + (Ki * intY) + (Kd * dY);
+
+  // Convert to servo angles
+  float pitchAngle = 90 + outX;  
+  float yawAngle   = 90 + outY;
+
+  // Limit angles
+  pitchAngle = constrain(pitchAngle, 0, 180);
+  yawAngle   = constrain(yawAngle, 0, 180);
+
+  // Move servos
+  servoPitch.write(pitchAngle);
+  servoYaw .write(yawAngle);
+
+  // === OPTIONAL: read altitude ===
+  float altitude = bmp.readAltitude();
+
+  // === DEBUG ===
+  Serial.print("GX: "); Serial.print(rateX);
+  Serial.print("  GY: "); Serial.print(rateY);
+  Serial.print("  SPitch: "); Serial.print(pitchAngle);
+  Serial.print("  SYaw: "); Serial.print(yawAngle);
+  Serial.print("  Alt: "); Serial.println(altitude);
+
+  // === LEDs ===
+  if (abs(rateX) > 40 || abs(rateY) > 40) {
+    digitalWrite(RED_LED, HIGH);
+  } else {
+    digitalWrite(RED_LED, LOW);
   }
 
-  // Continuous serial output every second
-  showData();
-  delay(1000);
+  delay(10);
 }
